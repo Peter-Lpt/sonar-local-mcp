@@ -1,5 +1,5 @@
 # --- Java / Maven ---
-sonar-local/target/
+sonar-local-mcp/target/
 *.class
 
 # --- 运行产物 ---

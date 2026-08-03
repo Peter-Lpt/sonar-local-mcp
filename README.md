@@ -1,4 +1,4 @@
-# sonar-local · 本地 Sonar MCP
+# sonar-local-mcp · 本地 Sonar MCP
 
 通过 [MCP(Model Context Protocol)](https://modelcontextprotocol.io) 在 AI 客户端
 (Reasonix / Claude Desktop / Cursor 等)中调用**本地 Sonar 引擎**做 Java 代码审查。
@@ -24,7 +24,7 @@ AI 客户端 (Reasonix / Claude / Cursor)
 sonar_mcp_server.py (FastMCP)
         │  subprocess 调用
         ▼
-sonar-local.jar (Java, 内嵌 sonarlint-core)
+sonar-local-mcp.jar (Java, 内嵌 sonarlint-core)
         │  输出 issues JSON
         ▼
 reports/sonar-report.json + 内存缓存
@@ -34,37 +34,53 @@ reports/sonar-report.json + 内存缓存
 
 ```
 mcp/
-├── sonar-local/                      # Java 引擎工具(内嵌 sonarlint-core)
-│   ├── pom.xml                       # 构建配置(sonarlint-core 9.8 + sonar-java-plugin 7.15)
+├── sonar-local-mcp/                 # Java 引擎工具(内嵌 sonarlint-core)
+│   ├── pom.xml                      # 构建配置(sonarlint-core 9.8 + sonar-java-plugin 7.15)
 │   └── src/main/java/com/qs/sonar/SonarLocal.java
 ├── server/
-│   ├── sonar_mcp_server.py           # MCP server(FastMCP, stdio transport)
-│   ├── test_client.py                # 协议往返回归测试
-│   └── requirements.txt              # Python 依赖(mcp SDK)
-├── reports/                          # 最近一次分析报告(运行时自动生成)
-├── LICENSE                           # MIT
+│   ├── sonar_mcp_server.py          # MCP server(FastMCP, stdio transport)
+│   ├── test_client.py               # 协议往返回归测试
+│   └── requirements.txt             # Python 依赖(mcp SDK)
+├── reports/                         # 最近一次分析报告(运行时自动生成)
+├── LICENSE                          # MIT
 └── README.md
 ```
 
 ## 环境要求
 
-| 组件 | 版本 | 用途 |
+| 组件 | 版本 | 说明 |
 |---|---|---|
-| JDK | 17+ | 运行 Sonar 分析引擎 |
-| Maven | 3.6+ | 构建引擎工具(fat jar) |
+| JDK | **17+** | 运行分析引擎的硬性要求(`sonarlint-core 9.8` 要求);17 / 21 / 25 均可 |
 | Python | 3.10+ | 运行 MCP server |
-| `mcp` SDK | ≥1.0 | MCP Python 库 |
+| `mcp` SDK | ≥1.0 | MCP Python 库(`pip install -r server/requirements.txt`) |
+| Maven | 3.6+ | **仅源码构建时需要**;直接使用预构建 jar 则不需要 |
 
-> 注意:`sonarlint-core 9.8` 要求 **JDK 17+**,低于 17 会启动失败。本机默认 `java` 若非
-> 17+,请用 `SONAR_JAVA` 环境变量显式指定(见下文)。
+> **JDK 为什么必须是 17+?** 这是嵌入的 `sonarlint-core 9.8` 库的硬性要求,不是配置项。
+> 低于 17(JRE 8/11)无法加载引擎。若你的默认 `java` 版本不足,用 `SONAR_JAVA` 环境变量
+> 显式指向 JDK 17+ 的 `java` 可执行文件(见下文接入配置)。
+>
+> **Maven 不是必须的**:引擎是 fat jar(`java -jar` 直接运行)。从源码构建才需要 Maven;
+> 直接下载预构建 jar 可完全跳过 Maven。
 
-## 安装与构建
+## 安装
+
+### 方式 A:直接使用预构建 jar(无需 Maven)
+
+1. 获取引擎 jar:从发布页下载 `sonar-local-mcp-0.0.1.jar` 与
+   `sonar-java-plugin-*.jar`,放到 `sonar-local-mcp/target/` 目录;
+2. 安装 Python 依赖:`python -m pip install -r server/requirements.txt`;
+3. 完成,见下方"接入 AI 客户端"。
+
+> MCP server 会自动发现 `target/` 下最新的 `sonar-local-mcp-*.jar`(不硬编码版本号),
+> 升级时直接替换 jar 即可,server 代码无需改动。
+
+### 方式 B:从源码构建(需要 JDK 17 + Maven)
 
 ```powershell
-# 1) 构建引擎工具(需 JDK 17 + Maven)
-cd sonar-local
+# 1) 构建引擎工具
+cd sonar-local-mcp
 mvn -B package -DskipTests
-# 产物: target/sonar-local-1.0.0.jar(fat jar)+ target/plugins/sonar-java-plugin-*.jar
+# 产物: target/sonar-local-mcp-0.0.1.jar(fat jar)+ target/plugins/sonar-java-plugin-*.jar
 
 # 2) 安装 Python 依赖(一次性)
 cd ../server
@@ -85,7 +101,7 @@ python test_client.py --src <你的Java项目目录> --max-files 30 --java C:\pa
 ## 命令行用法(不经 MCP)
 
 ```powershell
-java -jar sonar-local\target\sonar-local-1.0.0.jar --src <项目目录> [--out report.json] [--max-files N]
+java -jar sonar-local-mcp\target\sonar-local-mcp-0.0.1.jar --src <项目目录> [--out report.json] [--max-files N]
 ```
 
 - `--src`(必填)项目根目录;`--out` 报告输出路径(不填则仅打印到 stdout);
@@ -119,7 +135,7 @@ java -jar sonar-local\target\sonar-local-1.0.0.jar --src <项目目录> [--out r
 ```json
 {
   "mcpServers": {
-    "sonar-local": {
+    "sonar-local-mcp": {
       "command": "python",
       "args": ["<本仓库绝对路径>\\server\\sonar_mcp_server.py"],
       "env": {
@@ -150,8 +166,9 @@ java -jar sonar-local\target\sonar-local-1.0.0.jar --src <项目目录> [--out r
 
 ## 常见问题
 
-**Q: 提示 `sonar-local.jar not found`?**
-A: 未构建引擎工具。执行 `cd sonar-local && mvn -B package -DskipTests`(需 JDK 17 + Maven)。
+**Q: 提示 `sonar-local-mcp.jar not found`?**
+A: 引擎工具未构建。源码构建:`cd sonar-local-mcp && mvn -B package -DskipTests`(需 JDK 17 +
+Maven);或按"方式 A"下载预构建 jar 放入 `target/`(无需 Maven)。
 
 **Q: 提示 Java launcher not found / 引擎启动失败?**
 A: 默认 `java` 不是 JDK 17。通过 `SONAR_JAVA` 指向 JDK 17+ 的 `java.exe`。
@@ -173,6 +190,7 @@ A: 这是设计行为:`hint` 字段会给出 `list_issues(offset=..., limit=...)
 4. `sonar-java-plugin` 需以**独立 jar 文件**加载(`addPlugin(Path)`),不能打进 fat jar
    —— 构建时由 `maven-dependency-plugin` 复制到 `target/plugins/`;
 5. `ClientInputFile` 需实现全部抽象方法(含 `contents()` / `inputStream()` / `getClientObject()`)。
+6. MCP server 通过 `_find_jar()` 自动发现 `target/` 下最新构建的 jar,升级版本无需改代码。
 
 ## 许可证
 

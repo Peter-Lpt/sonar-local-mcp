@@ -4,7 +4,7 @@
 离线代码审查,零服务器、零驻留:引擎内嵌于 sonar-local.jar,要查才跑、跑完退出。
 
 本 server 的职责:
-  1. 调用 sonar-local.jar 执行分析并把报告缓存到内存与 reports/ 目录
+  1. 调用引擎 fat jar(sonar-local-mcp.jar)执行分析并把报告缓存到内存与 reports/ 目录
   2. 过滤 / 分页 / 汇总结果 —— 单次工具返回体有大小上限,超出的部分截断并给出
      获取更多数据的提示,避免大 JSON 被客户端截断导致解析失败
   3. 安全边界:get_source_code 只能读取"最近一次分析项目根目录"内的文件
@@ -33,7 +33,8 @@ from mcp.server.fastmcp import FastMCP
 # ---------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-JAR = BASE_DIR / "sonar-local" / "target" / "sonar-local-1.0.0.jar"
+# 引擎模块目录(其 target/ 下存放构建产物 jar,由 _find_jar 自动发现)
+ENGINE_DIR = BASE_DIR / "sonar-local-mcp"
 REPORT = BASE_DIR / "reports" / "sonar-report.json"
 
 # sonarlint-core 9.8 需要 Java 17+;默认用环境变量 SONAR_JAVA 指定的 JDK,
@@ -52,7 +53,7 @@ MAX_SNIPPET_BYTES = 1_000_000
 
 SEVERITY_ORDER = ["BLOCKER", "CRITICAL", "MAJOR", "MINOR", "INFO"]
 
-mcp = FastMCP("sonar-local")
+mcp = FastMCP("sonar-local-mcp")
 
 # ---------------------------------------------------------------------------
 # 状态与缓存
@@ -76,13 +77,30 @@ def _engine_error(msg: str) -> str:
 # 引擎调用
 # ---------------------------------------------------------------------------
 
+def _find_jar() -> Path | None:
+    """在引擎 target/ 目录自动发现最新构建的 fat jar,避免硬编码版本号。
+
+    排除 maven-shade 生成的 original-* 瘦 jar 与旧的 *-shaded.jar 残留。
+    """
+    target = ENGINE_DIR / "target"
+    if not target.is_dir():
+        return None
+    jars = [
+        p for p in target.glob("sonar-local-mcp-*.jar")
+        if not p.name.startswith("original-") and "-shaded" not in p.name
+    ]
+    if not jars:
+        return None
+    return max(jars, key=lambda p: p.stat().st_mtime)
+
+
 def _engine_ready() -> str | None:
     """返回 None 表示可用;否则返回缺失组件的安装提示。"""
-    if not JAR.is_file():
+    if _find_jar() is None:
         return (
-            f"sonar-local.jar not found: {JAR}\n"
+            f"sonar-local-mcp.jar not found under {ENGINE_DIR / 'target'}\n"
             "请先构建引擎工具(需要 JDK 17 与 Maven):\n"
-            "  cd sonar-local && mvn -B package -DskipTests\n"
+            "  cd sonar-local-mcp && mvn -B package -DskipTests\n"
             "或从发布页下载预构建 jar 放到 target/ 目录。"
         )
     return _java_warning_once()
@@ -124,9 +142,14 @@ def _probe_java() -> str | None:
 
 
 def _run_engine(project_path: Path, out_path: Path, max_files: int) -> dict:
-    """调用 sonar-local.jar 执行离线分析,返回报告 dict。失败时抛 RuntimeError。"""
+    """调用引擎 fat jar 执行离线分析,返回报告 dict。失败时抛 RuntimeError。"""
+    jar = _find_jar()
+    if jar is None:
+        raise RuntimeError(
+            "engine jar not found, run `mvn -B package -DskipTests` in sonar-local-mcp/ first"
+        )
     cmd = [
-        JAVA, "-jar", str(JAR),
+        JAVA, "-jar", str(jar),
         "--src", str(project_path),
         "--out", str(out_path),
         "--max-files", str(max_files),
@@ -135,7 +158,7 @@ def _run_engine(project_path: Path, out_path: Path, max_files: int) -> dict:
         proc = subprocess.run(
             cmd, capture_output=True, text=True,
             timeout=ANALYZE_TIMEOUT,
-            cwd=str(BASE_DIR / "sonar-local"),
+            cwd=str(ENGINE_DIR),
         )
     except FileNotFoundError:
         raise RuntimeError(
@@ -156,7 +179,7 @@ def _run_engine(project_path: Path, out_path: Path, max_files: int) -> dict:
                 " [java version too old?] sonarlint-core 9.8 requires JDK 17+; "
                 "set SONAR_JAVA to a JDK 17+ java executable"
             )
-        raise RuntimeError(f"sonar-local failed (rc={proc.returncode}): {tail[-2000:]}{hint}")
+        raise RuntimeError(f"engine failed (rc={proc.returncode}): {tail[-2000:]}{hint}")
 
     try:
         return json.loads(out_path.read_text(encoding="utf-8"))
@@ -382,12 +405,13 @@ def analyze_code_snippet(code: str, file_name: str = "Snippet.java") -> str:
 
 
 if __name__ == "__main__":
-    if not JAR.is_file():
+    if _find_jar() is None:
         print(
-            f"[sonar-local] WARNING: {JAR} not found — run `cd sonar-local && mvn -B package -DskipTests` first",
+            f"[sonar-local-mcp] WARNING: engine jar not found under {ENGINE_DIR / 'target'} — "
+            "run `cd sonar-local-mcp && mvn -B package -DskipTests` first",
             file=sys.stderr,
         )
     java_warning = _java_warning_once()
     if java_warning:
-        print(f"[sonar-local] WARNING: {java_warning}", file=sys.stderr)
+        print(f"[sonar-local-mcp] WARNING: {java_warning}", file=sys.stderr)
     mcp.run(transport="stdio")
