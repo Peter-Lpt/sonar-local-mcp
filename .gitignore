@@ -1,0 +1,19 @@
+# --- Java / Maven ---
+sonar-local/target/
+*.class
+
+# --- 运行产物 ---
+reports/
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db

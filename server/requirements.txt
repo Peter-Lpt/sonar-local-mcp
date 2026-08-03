@@ -1,0 +1,2 @@
+# MCP Python SDK(stdio transport server)
+mcp>=1.0.0
