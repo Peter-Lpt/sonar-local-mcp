@@ -34,16 +34,17 @@ reports/sonar-report.json + 内存缓存
 
 ```
 mcp/
-├── sonar-local-mcp/                 # Java 引擎工具(内嵌 sonarlint-core)
-│   ├── pom.xml                      # 构建配置(sonarlint-core 9.8 + sonar-java-plugin 7.15)
-│   └── src/main/java/com/qs/sonar/SonarLocal.java
-├── server/
-│   ├── sonar_mcp_server.py          # MCP server(FastMCP, stdio transport)
-│   ├── test_client.py               # 协议往返回归测试
-│   └── requirements.txt             # Python 依赖(mcp SDK)
-├── reports/                         # 最近一次分析报告(运行时自动生成)
-├── LICENSE                          # MIT
-└── README.md
+├── sonar-local-mcp/                 # 项目根(git 仓库)
+│   ├── engine/                       # Java 引擎工具(内嵌 sonarlint-core)
+│   │   ├── pom.xml                   # 构建配置(sonarlint-core 9.8 + sonar-java-plugin 7.15)
+│   │   └── src/main/java/com/qs/sonar/SonarLocal.java
+│   ├── server/
+│   │   ├── sonar_mcp_server.py       # MCP server(FastMCP, stdio transport)
+│   │   ├── test_client.py            # 协议往返回归测试
+│   │   └── requirements.txt          # Python 依赖(mcp SDK)
+│   ├── reports/                      # 最近一次分析报告(运行时自动生成)
+│   ├── LICENSE                       # MIT
+│   └── README.md
 ```
 
 ## 环境要求
@@ -67,18 +68,18 @@ mcp/
 ### 方式 A:直接使用预构建 jar(无需 Maven)
 
 1. 获取引擎 jar:从发布页下载 `sonar-local-mcp-0.0.1.jar` 与
-   `sonar-java-plugin-*.jar`,放到 `sonar-local-mcp/target/` 目录;
+   `sonar-java-plugin-*.jar`,放到 `engine/target/` 目录;
 2. 安装 Python 依赖:`python -m pip install -r server/requirements.txt`;
 3. 完成,见下方"接入 AI 客户端"。
 
-> MCP server 会自动发现 `target/` 下最新的 `sonar-local-mcp-*.jar`(不硬编码版本号),
+> MCP server 会自动发现 `engine/target/` 下最新的 `sonar-local-mcp-*.jar`(不硬编码版本号),
 > 升级时直接替换 jar 即可,server 代码无需改动。
 
 ### 方式 B:从源码构建(需要 JDK 17 + Maven)
 
 ```powershell
 # 1) 构建引擎工具
-cd sonar-local-mcp
+cd engine
 mvn -B package -DskipTests
 # 产物: target/sonar-local-mcp-0.0.1.jar(fat jar)+ target/plugins/sonar-java-plugin-*.jar
 
@@ -101,7 +102,7 @@ python test_client.py --src <你的Java项目目录> --max-files 30 --java C:\pa
 ## 命令行用法(不经 MCP)
 
 ```powershell
-java -jar sonar-local-mcp\target\sonar-local-mcp-0.0.1.jar --src <项目目录> [--out report.json] [--max-files N]
+java -jar engine\target\sonar-local-mcp-0.0.1.jar --src <项目目录> [--out report.json] [--max-files N]
 ```
 
 - `--src`(必填)项目根目录;`--out` 报告输出路径(不填则仅打印到 stdout);
@@ -167,8 +168,8 @@ java -jar sonar-local-mcp\target\sonar-local-mcp-0.0.1.jar --src <项目目录> 
 ## 常见问题
 
 **Q: 提示 `sonar-local-mcp.jar not found`?**
-A: 引擎工具未构建。源码构建:`cd sonar-local-mcp && mvn -B package -DskipTests`(需 JDK 17 +
-Maven);或按"方式 A"下载预构建 jar 放入 `target/`(无需 Maven)。
+A: 引擎工具未构建。源码构建:`cd engine && mvn -B package -DskipTests`(需 JDK 17 +
+Maven);或按"方式 A"下载预构建 jar 放入 `engine/target/`(无需 Maven)。
 
 **Q: 提示 Java launcher not found / 引擎启动失败?**
 A: 默认 `java` 不是 JDK 17。通过 `SONAR_JAVA` 指向 JDK 17+ 的 `java.exe`。
@@ -190,7 +191,7 @@ A: 这是设计行为:`hint` 字段会给出 `list_issues(offset=..., limit=...)
 4. `sonar-java-plugin` 需以**独立 jar 文件**加载(`addPlugin(Path)`),不能打进 fat jar
    —— 构建时由 `maven-dependency-plugin` 复制到 `target/plugins/`;
 5. `ClientInputFile` 需实现全部抽象方法(含 `contents()` / `inputStream()` / `getClientObject()`)。
-6. MCP server 通过 `_find_jar()` 自动发现 `target/` 下最新构建的 jar,升级版本无需改代码。
+6. MCP server 通过 `_find_jar()` 自动发现 `engine/target/` 下最新构建的 jar,升级版本无需改代码。
 
 ## 许可证
 

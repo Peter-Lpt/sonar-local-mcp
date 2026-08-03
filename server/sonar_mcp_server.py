@@ -34,7 +34,7 @@ from mcp.server.fastmcp import FastMCP
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 # 引擎模块目录(其 target/ 下存放构建产物 jar,由 _find_jar 自动发现)
-ENGINE_DIR = BASE_DIR / "sonar-local-mcp"
+ENGINE_DIR = BASE_DIR / "engine"
 REPORT = BASE_DIR / "reports" / "sonar-report.json"
 
 # sonarlint-core 9.8 需要 Java 17+;默认用环境变量 SONAR_JAVA 指定的 JDK,
@@ -100,8 +100,8 @@ def _engine_ready() -> str | None:
         return (
             f"sonar-local-mcp.jar not found under {ENGINE_DIR / 'target'}\n"
             "请先构建引擎工具(需要 JDK 17 与 Maven):\n"
-            "  cd sonar-local-mcp && mvn -B package -DskipTests\n"
-            "或从发布页下载预构建 jar 放到 target/ 目录。"
+            "  cd engine && mvn -B package -DskipTests\n"
+            "或从发布页下载预构建 jar 放到 engine/target/ 目录。"
         )
     return _java_warning_once()
 
@@ -146,7 +146,7 @@ def _run_engine(project_path: Path, out_path: Path, max_files: int) -> dict:
     jar = _find_jar()
     if jar is None:
         raise RuntimeError(
-            "engine jar not found, run `mvn -B package -DskipTests` in sonar-local-mcp/ first"
+            "engine jar not found, run `mvn -B package -DskipTests` in engine/ first"
         )
     cmd = [
         JAVA, "-jar", str(jar),
@@ -408,7 +408,7 @@ if __name__ == "__main__":
     if _find_jar() is None:
         print(
             f"[sonar-local-mcp] WARNING: engine jar not found under {ENGINE_DIR / 'target'} — "
-            "run `cd sonar-local-mcp && mvn -B package -DskipTests` first",
+            "run `cd engine && mvn -B package -DskipTests` first",
             file=sys.stderr,
         )
     java_warning = _java_warning_once()
