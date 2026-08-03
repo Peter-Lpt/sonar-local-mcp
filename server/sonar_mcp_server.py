@@ -200,13 +200,13 @@ def _summarize(items: list) -> dict:
     }
 
 
-def _hint(count: int, offset: int, limit: int, filtered: bool) -> str:
-    more = max(0, count - offset - limit)
-    if more <= 0:
+def _hint(count: int, next_offset: int, filtered: bool) -> str:
+    """生成翻页提示。next_offset 由调用方计算并保证严格前进(否则死循环)。"""
+    if next_offset >= count:
         return ""
     return (
-        f"{more} more issue(s) not shown. "
-        f"use list_issues(offset={offset + limit}, limit={limit}"
+        f"{count - next_offset} more issue(s) not shown. "
+        f"use list_issues(offset={next_offset}, limit=..."
         + (", severity=..., rule=...)" if filtered else ")")
         + " to fetch the next page"
     )
@@ -260,7 +260,7 @@ def analyze_project(project_path: str, max_files: int = 200, max_issues: int = 5
         "issues": shown,
         "shown": len(shown),
         "truncated": clipped or len(items) > max_issues,
-        "hint": _hint(len(items), 0, len(shown), filtered=False),
+        "hint": _hint(len(items), len(shown), filtered=False),
     }
     return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -288,7 +288,9 @@ def list_issues(severity: str = "", rule: str = "", limit: int = 100, offset: in
     offset = max(0, int(offset))
     page = items[offset:offset + limit]
     shown, clipped = _clip(page, len(page))
-    hint = _hint(len(items), offset, len(shown), filtered=bool(severity or rule))
+    # 下一页 offset 必须严格大于当前 offset:当单条超大把 shown 裁到 0 时也至少前进 1
+    next_offset = offset + max(len(shown), 1) if offset < len(items) else offset
+    hint = _hint(len(items), next_offset, filtered=bool(severity or rule))
     return json.dumps(
         {
             "count": len(items),
