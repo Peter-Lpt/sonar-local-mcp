@@ -1,0 +1,11 @@
+interface:
+  display_name: "Sonar 本地代码分析"
+  short_description: "用本地 Sonar 引擎做 Java 代码质量分析、问题分页过滤与代码片段审查"
+  default_prompt: "使用 $sonar-local-mcp 分析这个 Java 项目的代码质量。"
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "sonar-local-mcp"
+      description: "本地 Sonar 引擎 MCP server（stdio）"
+      transport: "stdio"

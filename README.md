@@ -43,6 +43,7 @@ mcp/
 │   │   ├── test_client.py            # 协议往返回归测试
 │   │   └── requirements.txt          # Python 依赖(mcp SDK)
 │   ├── reports/                      # 最近一次分析报告(运行时自动生成)
+│   ├── skills/sonar-local-mcp/       # Codex 引导 skill(SKILL.md + agents/openai.yaml)
 │   ├── LICENSE                       # MIT
 │   └── README.md
 ```
@@ -154,6 +155,23 @@ java -jar engine\target\sonar-local-mcp-0.0.1.jar --src <项目目录> [--out re
 | `SONAR_JAVA` | `java`(PATH 查找) | JDK 17+ 的 `java` 可执行文件绝对路径 |
 | `SONAR_TIMEOUT` | `900` | 单次分析超时(秒) |
 | `SONAR_MAX_TEXT` | `12000` | 单个工具返回体最大字符数 |
+
+## Codex 引导 skill
+
+MCP 是执行层，`skills/sonar-local-mcp/` 是配套的 Codex 引导 skill：装到 `~/.codex/skills/` 后
+Codex 会自动发现，负责教 agent 何时用哪个工具、结果截断时怎么翻页、有哪些坑。
+
+- **触发场景**：Java 项目/代码片段质量分析、按 severity/rule 查 issues、读 issue 对应源码；
+- **工作流**：`analyze_project` 先看 summary → 截断时按 `hint` 用 `list_issues` 翻页/过滤 →
+  `get_source_code` 读源码 → `analyze_code_snippet` 片段审查；
+- **CLI 回退**：MCP 不可用时直接运行引擎 fat jar（见"命令行用法"），无需 Python/MCP 依赖；
+- **已知坑**：JDK 必须 17+、jar 未构建先 `mvn package`、返回体截断是设计行为。
+
+安装：
+
+```powershell
+Copy-Item -Recurse skills\sonar-local-mcp $env:USERPROFILE\.codex\skills\
+```
 
 ## 安全与边界
 
