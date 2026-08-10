@@ -17,12 +17,16 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import Counter
 from pathlib import Path
 
@@ -37,21 +41,81 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 ENGINE_DIR = BASE_DIR / "engine"
 REPORT = BASE_DIR / "reports" / "sonar-report.json"
 
-# sonarlint-core 9.8 需要 Java 17+;默认用环境变量 SONAR_JAVA 指定的 JDK,
-# 未设置时回退到系统 PATH 中的 java(Windows 上可用 .mcp.json 的 env 注入)
-JAVA = os.environ.get("SONAR_JAVA", "java")
+# ---------------------------------------------------------------------------
+# 统一配置:可选配置文件(默认仓库根 sonar-local-config.json,可用 SONAR_CONFIG 指定)
+# + 环境变量覆盖。优先级:环境变量 > 配置文件 > 默认值。
+# 配置文件示例见 sonar-local-config.example.json。
+# ---------------------------------------------------------------------------
+
+SONAR_CONFIG_FILE = os.environ.get("SONAR_CONFIG") or str(BASE_DIR / "sonar-local-config.json")
+
+
+def _load_config_file() -> dict:
+    p = Path(SONAR_CONFIG_FILE)
+    if not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+CONFIG = _load_config_file()
+
+
+def _resolve(env_key: str, cfg_path: str, default):
+    """按 环境变量 -> 配置文件(点分路径) -> 默认值 取配置。"""
+    env = os.environ.get(env_key)
+    if env is not None and str(env).strip() != "":
+        return str(env).strip()
+    node = CONFIG
+    for part in cfg_path.split("."):
+        if isinstance(node, dict) and part in node:
+            node = node[part]
+        else:
+            return default
+    if isinstance(node, str):
+        node = node.strip()
+    return node if node not in (None, "") else default
+
+
+def _severity_str(value) -> str:
+    """把 severity 配置归一化为逗号分隔字符串(支持列表或字符串)。"""
+    if isinstance(value, list):
+        return ",".join(str(v).strip() for v in value if str(v).strip())
+    return str(value).strip() if value else ""
+
+
+# sonarlint-core 9.8 需要 Java 17+;默认用配置/环境变量指定的 JDK,
+# 未设置时回退到系统 PATH 中的 java(可用 SONAR_CONFIG 或 .mcp.json 的 env 注入)
+JAVA = _resolve("SONAR_JAVA", "sonar_java", "java")
 
 # 引擎单次分析超时(秒)
-ANALYZE_TIMEOUT = int(os.environ.get("SONAR_TIMEOUT", "900"))
+ANALYZE_TIMEOUT = int(_resolve("SONAR_TIMEOUT", "timeout_seconds", 900))
 
 # 单个工具返回体的最大字符数。超过该值的内容会被截断并在结果中给出
 # "hint",提示调用方用分页参数继续取 —— 防止大 JSON 超出客户端单次结果上限。
-MAX_TEXT_CHARS = int(os.environ.get("SONAR_MAX_TEXT", "12000"))
+MAX_TEXT_CHARS = int(_resolve("SONAR_MAX_TEXT", "max_text_chars", 12000))
+
+# 远程 SonarQube(自建/SonarQube Cloud)连接配置。配置后分析会拉取该服务器的
+# 质量配置(quality profile)中启用的规则,用远程规则做本地校验;
+# 不配置则走本地插件默认规则(与旧行为一致)。
+SONARQUBE_URL = _resolve("SONARQUBE_URL", "sonarqube.url", "").rstrip("/")
+SONARQUBE_TOKEN = _resolve("SONARQUBE_TOKEN", "sonarqube.token", "")
+# 质量配置定位(二选一):直接给 profile 名称/key,或给 project key 自动解析其生效配置
+SONARQUBE_PROFILE = _resolve("SONARQUBE_PROFILE", "sonarqube.profile", "")
+SONARQUBE_PROJECT = _resolve("SONARQUBE_PROJECT", "sonarqube.project", "")
 
 # analyze_code_snippet 的代码片段大小上限(字节)
 MAX_SNIPPET_BYTES = 1_000_000
 
 SEVERITY_ORDER = ["BLOCKER", "CRITICAL", "MAJOR", "MINOR", "INFO"]
+
+# 用户自定义的默认严重级别过滤(配置文件 severity/min_severity 或环境变量调)
+# 作为 analyze_project / list_issues 的默认过滤条件;调用时显式传参可覆盖。
+DEFAULT_SEVERITY = _severity_str(_resolve("SONAR_SEVERITY", "severity", ""))
+DEFAULT_MIN_SEVERITY = _severity_str(_resolve("SONAR_MIN_SEVERITY", "min_severity", ""))
 
 mcp = FastMCP("sonar-local-mcp")
 
@@ -141,7 +205,105 @@ def _probe_java() -> str | None:
     return None
 
 
-def _run_engine(project_path: Path, out_path: Path, max_files: int) -> dict:
+# ---------------------------------------------------------------------------
+# 远程 SonarQube 规则配置拉取(用于本地用远程规则做校验)
+# ---------------------------------------------------------------------------
+
+def _sq_http_get(path_query: str, timeout: int = 30) -> dict:
+    """对 SonarQube 服务器发起带 Basic Auth 的 GET,返回解析后的 JSON。失败抛 RuntimeError。"""
+    url = f"{SONARQUBE_URL}/api/{path_query}"
+    req = urllib.request.Request(url, headers={"Authorization": "Basic " + _b64(SONARQUBE_TOKEN)})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8")[:300]
+        except Exception:
+            pass
+        raise RuntimeError(f"SonarQube API {e.code} for {url}: {body or e.reason}") from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"cannot reach SonarQube {url}: {e.reason}") from None
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"SonarQube API returned non-JSON for {url}: {e}") from None
+
+
+def _b64(s: str) -> str:
+    return base64.b64encode((s + ":").encode("utf-8")).decode("ascii")
+
+
+def _resolve_profile_key() -> str | None:
+    """解析用户要用的质量配置 key。返回 None 表示无需远程规则。"""
+    if not SONARQUBE_URL or not SONARQUBE_TOKEN:
+        return None
+    if not SONARQUBE_PROFILE and not SONARQUBE_PROJECT:
+        return None
+    try:
+        if SONARQUBE_PROJECT:
+            data = _sq_http_get(
+                f"qualityprofiles/search?projectKey={urllib.parse.quote(SONARQUBE_PROJECT)}")
+            java_profiles = [p for p in data.get("profiles", []) if p.get("language") == "java"]
+            if not java_profiles:
+                return None
+            # 项目生效的 profile 是其 java 默认(isDefault=true)的那个
+            for p in java_profiles:
+                if p.get("isDefault"):
+                    return p.get("key")
+            return java_profiles[0].get("key")
+        else:
+            data = _sq_http_get("qualityprofiles/search")
+            for p in data.get("profiles", []):
+                if p.get("language") == "java" and (
+                    p.get("name") == SONARQUBE_PROFILE
+                    or p.get("key") == SONARQUBE_PROFILE
+                ):
+                    return p.get("key")
+    except RuntimeError as e:
+        raise RuntimeError("remote rule fetch failed: " + str(e)) from None
+    return None
+
+
+def _fetch_remote_rules() -> Path | None:
+    """拉取远程质量配置的启用规则,写成引擎可读的 JSON,返回该文件路径。
+
+    未配置 SONARQUBE_URL/TOKEN 或规则拉取为空时返回 None(走本地默认规则)。
+    """
+    profile = _resolve_profile_key()
+    if profile is None:
+        return None
+    enabled: list[str] = []
+    params: dict[str, dict[str, str]] = {}
+    page, ps, total = 1, 500, None
+    while total is None or (page - 1) * ps < total:
+        data = _sq_http_get(
+            f"rules/search?qprofile={urllib.parse.quote(profile)}"
+            f"&activation=true&languages=java&ps={ps}&p={page}&f=actives")
+        total = data.get("total", 0)
+        for r in data.get("rules", []):
+            key = r.get("key")
+            if not key:
+                continue
+            enabled.append(key)
+            # java:S 之外的规则(FindBugs 等)本地插件没有,记录但无法生效
+        actives = data.get("actives") or {}
+        for key, entries in actives.items():
+            for e in entries:
+                pa = {p["key"]: str(p.get("value")) for p in e.get("params", []) if p.get("key")}
+                if pa:
+                    params.setdefault(key, {}).update(pa)
+        page += 1
+    if not enabled:
+        return None
+
+    rules_file = Path(tempfile.mkdtemp(prefix="sonarlocal-rules-")) / "rules.json"
+    rules_file.write_text(json.dumps({"enabled": enabled, "params": params}, ensure_ascii=False),
+                          encoding="utf-8")
+    return rules_file
+
+
+def _run_engine(project_path: Path, out_path: Path, max_files: int,
+                rules_file: Path | None = None) -> dict:
     """调用引擎 fat jar 执行离线分析,返回报告 dict。失败时抛 RuntimeError。"""
     jar = _find_jar()
     if jar is None:
@@ -154,6 +316,8 @@ def _run_engine(project_path: Path, out_path: Path, max_files: int) -> dict:
         "--out", str(out_path),
         "--max-files", str(max_files),
     ]
+    if rules_file is not None:
+        cmd += ["--rules", str(rules_file)]
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True,
@@ -212,6 +376,30 @@ def _clip(items: list, limit: int, max_chars: int = MAX_TEXT_CHARS) -> tuple[lis
     return shown[:lo], True
 
 
+def _severity_rank(sev: str) -> int:
+    """严重级别排序:BLOCKER=0 … INFO=4,未知级别排最后。"""
+    if sev in SEVERITY_ORDER:
+        return SEVERITY_ORDER.index(sev)
+    return len(SEVERITY_ORDER)
+
+
+def _filter_issues(items: list, severities: str = "", min_severity: str = "") -> list:
+    """按严重级别集合与最低级别双重过滤。severities 支持逗号分隔。"""
+    if not severities and not min_severity:
+        return items
+    keep = {s.strip().upper() for s in severities.split(",") if s.strip()} if severities else set()
+    min_rank = _severity_rank(min_severity.strip().upper()) if min_severity else None
+    result = []
+    for i in items:
+        sev = (i.get("severity") or "").upper()
+        if keep and sev not in keep:
+            continue
+        if min_rank is not None and _severity_rank(sev) > min_rank:
+            continue
+        result.append(i)
+    return result
+
+
 def _summarize(items: list) -> dict:
     by_severity = Counter((i.get("severity") or "UNKNOWN") for i in items)
     by_type = Counter((i.get("type") or "UNKNOWN") for i in items)
@@ -240,7 +428,8 @@ def _hint(count: int, next_offset: int, filtered: bool) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def analyze_project(project_path: str, max_files: int = 200, max_issues: int = 500) -> str:
+def analyze_project(project_path: str, max_files: int = 200, max_issues: int = 500,
+                    severity: str = "", min_severity: str = "") -> str:
     """对本地 Java 项目执行 Sonar 引擎离线分析,返回汇总统计 + issues 列表(JSON)。
 
     返回体有大小上限,超出部分会被截断并在 "hint" 中提示用 list_issues 分页获取,
@@ -250,6 +439,10 @@ def analyze_project(project_path: str, max_files: int = 200, max_issues: int = 5
         project_path: 项目根目录绝对路径。
         max_files: 最多分析文件数(0 = 不限,默认 200)。
         max_issues: 报告内最多携带的 issue 条目数(默认 500,超出走分页)。
+        severity: 逗号分隔的严重级别集合(BLOCKER,CRITICAL,MAJOR,MINOR,INFO),
+                  留空 = 全部(或回退到 SONAR_SEVERITY 配置)。例如 "BLOCKER,CRITICAL,MAJOR"。
+        min_severity: 只保留等于或高于该级别的问题(如 MAJOR = 输出 BLOCKER/CRITICAL/MAJOR),
+                      留空 = 不按最低级别过滤(或回退到 SONAR_MIN_SEVERITY 配置)。
     """
     ready = _engine_ready()
     if ready:
@@ -268,12 +461,18 @@ def analyze_project(project_path: str, max_files: int = 200, max_issues: int = 5
     out_path = REPORT
     out_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        data = _run_engine(src, out_path, max_files)
+        rules_file = _fetch_remote_rules()
+    except RuntimeError as e:
+        return _engine_error(str(e))
+    try:
+        data = _run_engine(src, out_path, max_files, rules_file)
     except RuntimeError as e:
         return _engine_error(str(e))
 
     _cached = data
     items = data.get("issues", [])
+    # 未显式传过滤条件时,回退到用户配置的默认过滤(SONAR_SEVERITY / SONAR_MIN_SEVERITY)
+    items = _filter_issues(items, severity or DEFAULT_SEVERITY, min_severity or DEFAULT_MIN_SEVERITY)
     shown, clipped = _clip(items, max_issues)
     result = {
         "project": data.get("project"),
@@ -289,21 +488,24 @@ def analyze_project(project_path: str, max_files: int = 200, max_issues: int = 5
 
 
 @mcp.tool()
-def list_issues(severity: str = "", rule: str = "", limit: int = 100, offset: int = 0) -> str:
+def list_issues(severity: str = "", rule: str = "", min_severity: str = "",
+                limit: int = 100, offset: int = 0) -> str:
     """分页过滤最近一次分析的结果(先调 analyze_project)。
 
     Args:
-        severity: BLOCKER/CRITICAL/MAJOR/MINOR/INFO,留空 = 全部。
+        severity: 逗号分隔的严重级别集合(BLOCKER,CRITICAL,MAJOR,MINOR,INFO),
+                  留空 = 全部(或回退到 SONAR_SEVERITY 配置)。例如 "BLOCKER,CRITICAL,MAJOR"。
         rule: 规则 key 子串(如 "java:S106"),留空 = 全部。
+        min_severity: 只保留等于或高于该级别的问题(如 MAJOR = 输出 BLOCKER/CRITICAL/MAJOR),
+                      留空 = 不按最低级别过滤(或回退到 SONAR_MIN_SEVERITY 配置)。
         limit: 本次最多返回条数(默认 100,上限 500)。
         offset: 跳过前 N 条(用于翻页)。
     """
     if _cached is None:
         return _no_analysis()
 
-    items = _cached.get("issues", [])
-    if severity:
-        items = [i for i in items if (i.get("severity") or "").upper() == severity.upper()]
+    # 未显式传过滤条件时,回退到用户配置的默认过滤(SONAR_SEVERITY / SONAR_MIN_SEVERITY)
+    items = _filter_issues(_cached.get("issues", []), severity or DEFAULT_SEVERITY, min_severity or DEFAULT_MIN_SEVERITY)
     if rule:
         items = [i for i in items if rule in (i.get("ruleKey") or "")]
 
@@ -391,7 +593,11 @@ def analyze_code_snippet(code: str, file_name: str = "Snippet.java") -> str:
         (src_dir / name).write_text(code, encoding="utf-8")
         out_path = Path(tmp) / "report.json"
         try:
-            data = _run_engine(src_dir, out_path, max_files=10)
+            rules_file = _fetch_remote_rules()
+        except RuntimeError as e:
+            return _engine_error(str(e))
+        try:
+            data = _run_engine(src_dir, out_path, max_files=10, rules_file=rules_file)
         except RuntimeError as e:
             return _engine_error(str(e))
 

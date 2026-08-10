@@ -71,6 +71,17 @@ async def main(project: str, max_files: int, java: str):
             print(f"[3] list_issues(CRITICAL, limit=5): count={d['count']} returned={d['returned']}")
             assert all(i["severity"] == "CRITICAL" for i in d["issues"]), "severity 过滤失效"
 
+            # 3b) 多级别集合 + 最低级别过滤
+            res = await session.call_tool("list_issues", {"severity": "BLOCKER,CRITICAL,MAJOR"})
+            d = json.loads(_ok(res))
+            print(f"[3b] list_issues(set BLOCKER,CRITICAL,MAJOR): count={d['count']}")
+            assert all(i["severity"] in ("BLOCKER", "CRITICAL", "MAJOR") for i in d["issues"]), "多级别集合过滤失效"
+
+            res = await session.call_tool("list_issues", {"min_severity": "MAJOR"})
+            d = json.loads(_ok(res))
+            print(f"[3b] list_issues(min_severity=MAJOR): count={d['count']}")
+            assert all(i["severity"] in ("BLOCKER", "CRITICAL", "MAJOR") for i in d["issues"]), "min_severity 过滤失效"
+
             res = await session.call_tool("list_issues", {"limit": 3, "offset": 0})
             page1 = json.loads(_ok(res))
             res = await session.call_tool("list_issues", {"limit": 3, "offset": 3})

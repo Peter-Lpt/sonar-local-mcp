@@ -4,7 +4,7 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>com.qs</groupId>
+    <groupId>com.sonarlocal</groupId>
     <artifactId>sonar-local-mcp</artifactId>
     <version>0.0.1</version>
     <packaging>jar</packaging>
@@ -46,6 +46,17 @@
     </dependencies>
 
     <build>
+        <resources>
+            <!-- 把仓库根目录的第三方许可声明与 LGPL-3.0 副本打进 jar,随分发携带 -->
+            <resource>
+                <directory>${project.basedir}/..</directory>
+                <targetPath>META-INF</targetPath>
+                <includes>
+                    <include>THIRD_PARTY_NOTICES.md</include>
+                    <include>LICENSES/LGPL-3.0.txt</include>
+                </includes>
+            </resource>
+        </resources>
         <plugins>
             <!-- 把 sonar-java-plugin jar 复制到 target/plugins/,运行时 addPlugin 加载 -->
             <plugin>
@@ -101,7 +112,7 @@
                             </artifactSet>
                             <transformers>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                                    <mainClass>com.qs.sonar.SonarLocal</mainClass>
+                                    <mainClass>com.sonarlocal.SonarLocal</mainClass>
                                 </transformer>
                             </transformers>
                         </configuration>

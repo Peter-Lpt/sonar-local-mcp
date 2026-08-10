@@ -1,0 +1,14 @@
+{
+  "_comment": "sonar-local-mcp 统一配置文件。复制为 sonar-local-config.json 后按需填写;也可用 SONAR_CONFIG 环境变量指向其它路径。优先级:环境变量 > 本文件 > 默认值。",
+  "sonar_java": "",
+  "timeout_seconds": 900,
+  "max_text_chars": 12000,
+  "severity": "",
+  "min_severity": "",
+  "sonarqube": {
+    "url": "",
+    "token": "",
+    "profile": "",
+    "project": ""
+  }
+}

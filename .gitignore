@@ -5,6 +5,9 @@ engine/target/
 # --- 运行产物 ---
 reports/
 
+# --- 本地敏感配置(真实配置不入库,示例保留) ---
+sonar-local-config.json
+
 # --- Python ---
 __pycache__/
 *.pyc

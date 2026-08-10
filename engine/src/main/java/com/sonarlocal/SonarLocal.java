@@ -1,4 +1,4 @@
-package com.qs.sonar;
+package com.sonarlocal;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.sonarsource.sonarlint.core.StandaloneSonarLintEngineImpl;
@@ -11,6 +11,7 @@ import org.sonarsource.sonarlint.core.client.api.standalone.StandaloneAnalysisCo
 import org.sonarsource.sonarlint.core.client.api.standalone.StandaloneGlobalConfiguration;
 import org.sonarsource.sonarlint.core.client.api.standalone.StandaloneSonarLintEngine;
 import org.sonarsource.sonarlint.core.commons.Language;
+import org.sonarsource.sonarlint.core.commons.RuleKey;
 import org.sonarsource.sonarlint.core.commons.log.ClientLogOutput;
 
 import java.io.IOException;
@@ -57,12 +58,14 @@ public class SonarLocal {
   private static int run(String[] args) throws Exception {
     String src = null;
     String out = null;
+    String rulesFile = null;
     int maxFiles = 0; // 0 = 不限
 
     for (int i = 0; i < args.length; i++) {
       switch (args[i]) {
         case "--src" -> src = (i + 1 < args.length) ? args[++i] : null;
         case "--out" -> out = (i + 1 < args.length) ? args[++i] : null;
+        case "--rules" -> rulesFile = (i + 1 < args.length) ? args[++i] : null;
         case "--max-files" -> {
           if (i + 1 >= args.length) {
             throw new IllegalArgumentException("--max-files requires an integer value");
@@ -99,7 +102,8 @@ public class SonarLocal {
       return 0;
     }
 
-    List<Map<String, Object>> issues = analyze(baseDir, paths);
+    RulesConfig rules = rulesFile != null ? loadRulesConfig(Path.of(rulesFile)) : RulesConfig.NONE;
+    List<Map<String, Object>> issues = analyze(baseDir, paths, rules);
     Map<String, Object> report = new LinkedHashMap<>();
     report.put("tool", TOOL_VERSION);
     report.put("project", baseDir.toString());
@@ -132,8 +136,40 @@ public class SonarLocal {
     return false;
   }
 
+  /** 用户通过 --rules 提供的规则覆盖:enabled = 只启用这些规则;params = 规则参数。 */
+  private record RulesConfig(List<String> enabled, Map<String, Map<String, String>> params) {
+    static final RulesConfig NONE = new RulesConfig(List.of(), Map.of());
+    boolean provided() { return !enabled.isEmpty(); }
+  }
+
+  private static RulesConfig loadRulesConfig(Path file) throws IOException {
+    ObjectMapper om = new ObjectMapper();
+    Map<String, Object> root = om.readValue(file.toFile(), Map.class);
+    List<String> enabled = new ArrayList<>();
+    Object en = root.get("enabled");
+    if (en instanceof List<?> l) {
+      for (Object o : l) {
+        if (o != null && !o.toString().isBlank()) enabled.add(o.toString());
+      }
+    }
+    Map<String, Map<String, String>> params = new LinkedHashMap<>();
+    Object pr = root.get("params");
+    if (pr instanceof Map<?, ?> m) {
+      for (Map.Entry<?, ?> e : m.entrySet()) {
+        Map<String, String> p = new LinkedHashMap<>();
+        if (e.getValue() instanceof Map<?, ?> vm) {
+          for (Map.Entry<?, ?> pe : vm.entrySet()) {
+            p.put(String.valueOf(pe.getKey()), pe.getValue() == null ? "" : String.valueOf(pe.getValue()));
+          }
+        }
+        params.put(String.valueOf(e.getKey()), p);
+      }
+    }
+    return new RulesConfig(enabled, params);
+  }
+
   /** 运行分析,任何情况下都会释放引擎资源。 */
-  private static List<Map<String, Object>> analyze(Path baseDir, List<Path> paths) throws IOException {
+  private static List<Map<String, Object>> analyze(Path baseDir, List<Path> paths, RulesConfig rules) throws IOException {
     StandaloneSonarLintEngine engine = null;
     try {
       Path workDir = Files.createTempDirectory("sonarlocal-work");
@@ -166,10 +202,28 @@ public class SonarLocal {
       }
 
       List<ClientInputFile> files = paths.stream().map(p -> onDisk(p, baseDir)).toList();
-      StandaloneAnalysisConfiguration config = StandaloneAnalysisConfiguration.builder()
+      StandaloneAnalysisConfiguration.Builder configBuilder = StandaloneAnalysisConfiguration.builder()
         .setBaseDir(baseDir)
-        .addInputFiles(files)
-        .build();
+        .addInputFiles(files);
+      if (rules.provided()) {
+        // 远程质量配置生效:只启用指定规则,并把其余的插件默认规则全部关闭,
+        // 使本地分析结果与远程 SonarQube 质量配置一致。
+        List<String> allKeys = engine.getAllRuleDetails().stream().map(d -> d.getKey()).toList();
+        List<RuleKey> enabled = rules.enabled().stream().map(RuleKey::parse).toList();
+        List<RuleKey> excluded = allKeys.stream()
+          .filter(k -> !rules.enabled().contains(k))
+          .map(RuleKey::parse)
+          .toList();
+        configBuilder.addIncludedRules(enabled);
+        configBuilder.addExcludedRules(excluded);
+        for (Map.Entry<String, Map<String, String>> e : rules.params().entrySet()) {
+          configBuilder.addRuleParameters(RuleKey.parse(e.getKey()), e.getValue());
+        }
+        System.err.println("[sonarlint] applying remote rules: enabled=" + enabled.size()
+          + ", excluded=" + excluded.size()
+          + ", params=" + rules.params().size());
+      }
+      StandaloneAnalysisConfiguration config = configBuilder.build();
 
       List<Map<String, Object>> issues = new ArrayList<>();
       IssueListener listener = issue -> issues.add(toMap(issue));
