@@ -169,6 +169,7 @@ flowchart TD
   "sonar_java": "C:\\path\\to\\jdk-17\\bin\\java.exe",
   "timeout_seconds": 900,
   "max_text_chars": 12000,
+  "remote_rules_ttl_seconds": 900,
   "severity": "BLOCKER,CRITICAL,MAJOR",
   "min_severity": "",
   "sonarqube": {
@@ -182,6 +183,7 @@ flowchart TD
 
 - `severity` / `min_severity`:输出规则的严重级别过滤(也支持数组 `["BLOCKER","CRITICAL","MAJOR"]`);
 - `sonarqube` 段:配置规则服务器(远程 SonarQube),开启"用远程质量配置规则做本地校验";不填则用本地默认规则;
+- `remote_rules_ttl_seconds`:远程规则拉取结果的缓存时长(秒,默认 900),避免每次分析都重复请求 SonarQube;质量配置若要立即生效可调小或重启 server;
 - 所有字段均可空,也可用同名环境变量代替(此时 env 优先)。
 
 ### 环境变量

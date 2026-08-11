@@ -3,6 +3,7 @@
   "sonar_java": "",
   "timeout_seconds": 900,
   "max_text_chars": 12000,
+  "remote_rules_ttl_seconds": 900,
   "severity": "",
   "min_severity": "",
   "sonarqube": {
