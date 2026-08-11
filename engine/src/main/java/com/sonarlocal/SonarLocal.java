@@ -9,6 +9,7 @@ import org.sonarsource.sonarlint.core.client.api.common.analysis.Issue;
 import org.sonarsource.sonarlint.core.client.api.common.analysis.IssueListener;
 import org.sonarsource.sonarlint.core.client.api.standalone.StandaloneAnalysisConfiguration;
 import org.sonarsource.sonarlint.core.client.api.standalone.StandaloneGlobalConfiguration;
+import org.sonarsource.sonarlint.core.client.api.standalone.StandaloneRuleDetails;
 import org.sonarsource.sonarlint.core.client.api.standalone.StandaloneSonarLintEngine;
 import org.sonarsource.sonarlint.core.commons.Language;
 import org.sonarsource.sonarlint.core.commons.RuleKey;
@@ -22,9 +23,12 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Stream;
 
 /**
@@ -113,23 +117,26 @@ public class SonarLocal {
     return 0;
   }
 
-  /** 递归收集 .java 文件,跳过 target/ 与 .git/ 目录。 */
+  /** 递归收集 .java 文件,跳过常见构建产物目录(target/.git/build/out/.gradle)。 */
+  private static final Set<String> SKIP_DIRS = Set.of("target", ".git", "build", "out", ".gradle");
+
   private static List<Path> collectJavaFiles(Path baseDir, int maxFiles) throws IOException {
     List<Path> paths = new ArrayList<>();
     try (Stream<Path> walk = Files.walk(baseDir)) {
       walk.filter(Files::isRegularFile)
         .filter(p -> p.getFileName().toString().endsWith(".java"))
-        .filter(p -> !isUnder(p, "target") && !isUnder(p, ".git"))
+        .filter(p -> !isUnder(p, baseDir, SKIP_DIRS))
         .limit(maxFiles > 0 ? maxFiles : Long.MAX_VALUE)
         .forEach(paths::add);
     }
     return paths;
   }
 
-  /** 判断 path 的某个祖先目录(含自身所在目录)是否名为 dirName。 */
-  private static boolean isUnder(Path path, String dirName) {
-    for (Path part : path) {
-      if (part.toString().equals(dirName)) {
+  /** 判断 path 的某个祖先目录(不含项目根自身)是否命中 dirNames 之一。
+   *  以 baseDir 为基准做相对化,避免项目根恰好叫 build/target 等时被误过滤。 */
+  private static boolean isUnder(Path path, Path baseDir, Set<String> dirNames) {
+    for (Path part : baseDir.relativize(path)) {
+      if (dirNames.contains(part.toString())) {
         return true;
       }
     }
@@ -201,6 +208,8 @@ public class SonarLocal {
           + " skip=" + pd.skipReason().map(Object::toString).orElse("none"));
       }
 
+      // 只查询一次规则详情,供启用/排除计算与日志统计复用
+      Collection<StandaloneRuleDetails> allRuleDetails = engine.getAllRuleDetails();
       List<ClientInputFile> files = paths.stream().map(p -> onDisk(p, baseDir)).toList();
       StandaloneAnalysisConfiguration.Builder configBuilder = StandaloneAnalysisConfiguration.builder()
         .setBaseDir(baseDir)
@@ -208,16 +217,37 @@ public class SonarLocal {
       if (rules.provided()) {
         // 远程质量配置生效:只启用指定规则,并把其余的插件默认规则全部关闭,
         // 使本地分析结果与远程 SonarQube 质量配置一致。
-        List<String> allKeys = engine.getAllRuleDetails().stream().map(d -> d.getKey()).toList();
-        List<RuleKey> enabled = rules.enabled().stream().map(RuleKey::parse).toList();
+        // 远程配置可能含本地插件不认识的规则(findbugs/external_* 等)或畸形键,
+        // RuleKey.parse 会抛异常,故先与本地规则做交集,再逐个安全解析并跳过。
+        List<String> allKeys = allRuleDetails.stream().map(StandaloneRuleDetails::getKey).toList();
+        Set<String> known = new HashSet<>(allKeys);
+        List<RuleKey> enabled = new ArrayList<>();
+        for (String key : rules.enabled()) {
+          if (!known.contains(key)) {
+            System.err.println("[sonarlint] skip unknown remote rule: " + key);
+            continue;
+          }
+          try {
+            enabled.add(RuleKey.parse(key));
+          } catch (IllegalArgumentException e) {
+            System.err.println("[sonarlint] skip unparseable rule key: " + key);
+          }
+        }
         List<RuleKey> excluded = allKeys.stream()
           .filter(k -> !rules.enabled().contains(k))
           .map(RuleKey::parse)
           .toList();
         configBuilder.addIncludedRules(enabled);
         configBuilder.addExcludedRules(excluded);
-        for (Map.Entry<String, Map<String, String>> e : rules.params().entrySet()) {
-          configBuilder.addRuleParameters(RuleKey.parse(e.getKey()), e.getValue());
+        for (String key : rules.params().keySet()) {
+          if (!known.contains(key)) {
+            continue;
+          }
+          try {
+            configBuilder.addRuleParameters(RuleKey.parse(key), rules.params().get(key));
+          } catch (IllegalArgumentException e) {
+            System.err.println("[sonarlint] skip unparseable rule param key: " + key);
+          }
         }
         System.err.println("[sonarlint] applying remote rules: enabled=" + enabled.size()
           + ", excluded=" + excluded.size()
@@ -233,7 +263,7 @@ public class SonarLocal {
       System.err.println("[sonarlint] done: indexed=" + results.indexedFileCount()
         + ", failedFiles=" + results.failedAnalysisFiles().size()
         + ", issues=" + issues.size()
-        + ", loadedRules=" + engine.getAllRuleDetails().size());
+        + ", loadedRules=" + allRuleDetails.size());
       return issues;
     } finally {
       if (engine != null) {
@@ -260,12 +290,18 @@ public class SonarLocal {
     if (out != null) {
       Path outPath = Path.of(out);
       if (outPath.getParent() != null) {
-        Files.createDirectories(outPath.getParent());
+        try {
+          Files.createDirectories(outPath.getParent());
+        } catch (java.nio.file.FileAlreadyExistsException e) {
+          // 父目录已存在(如 macOS 的 /tmp 是符号链接),忽略
+        }
       }
       Files.writeString(outPath, json, StandardCharsets.UTF_8);
       System.err.println("[sonarlint] report written to " + outPath.toAbsolutePath());
+    } else {
+      // 指定 --out 时只写文件(MCP 路径恒用 --out),避免把完整报告再序列化一份到 stdout 被丢弃
+      System.out.println(json);
     }
-    System.out.println(json);
   }
 
   private static Map<String, Object> toMap(Issue issue) {
