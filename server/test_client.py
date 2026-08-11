@@ -91,6 +91,15 @@ async def main(project: str, max_files: int, java: str):
             assert not set(ids1) & set(ids2), "分页 offset 失效,两页内容重叠"
             print(f"[3] pagination OK: page1={len(ids1)} page2={len(ids2)} no overlap")
 
+            # 3c) C1 回归:过滤后的翻页 hint 必须携带实际过滤条件,否则翻页丢过滤
+            res = await session.call_tool("list_issues", {"min_severity": "CRITICAL", "limit": 1, "offset": 0})
+            d = json.loads(_ok(res))
+            if d["hint"]:
+                assert "min_severity" in d["hint"], f"过滤翻页 hint 应携带 min_severity, got: {d['hint']}"
+                print(f"[3c] filtered pagination hint carries filter OK: {d['hint'][:80]}")
+            else:
+                print("[3c] no truncation, hint empty (skip)")
+
             # 4) 源码读取边界
             first = report["issues"][0]["file"] if report["issues"] else None
             if first:

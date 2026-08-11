@@ -1,18 +1,13 @@
-"""本地 Sonar MCP Server(stdio transport)。
+"""本地 Sonar MCP server(stdio)。
 
-在 AI 客户端(Reasonix / Claude / Cursor 等)中通过 MCP 调用本地 Sonar 引擎做
-离线代码审查,零服务器、零驻留:引擎内嵌于 sonar-local.jar,要查才跑、跑完退出。
+供任意 MCP 客户端(Reasonix / Claude / Cursor / Codex 等)经 stdio 调用本地 Sonar
+引擎(sonar-local.jar,内嵌 sonarlint-core)离线审查 Java 代码,零服务器、零驻留。
 
-本 server 的职责:
-  1. 调用引擎 fat jar(sonar-local-mcp.jar)执行分析并把报告缓存到内存与 reports/ 目录
-  2. 过滤 / 分页 / 汇总结果 —— 单次工具返回体有大小上限,超出的部分截断并给出
-     获取更多数据的提示,避免大 JSON 被客户端截断导致解析失败
-  3. 安全边界:get_source_code 只能读取"最近一次分析项目根目录"内的文件
-  4. 可预期错误(路径不存在、jar 未构建、报告缺失等)一律返回结构化 {"error": ...}
-     文本而不是抛异常,让客户端拿到的是可读信息而非调用失败
+职责:调引擎分析并缓存报告;过滤/分页/汇总(控制返回体大小避免客户端截断);
+get_source_code 仅读最近分析项目根内文件;可预期错误返回结构化 {"error":...}。
 
-依赖:  python -m pip install -r requirements.txt
-用法:  python sonar_mcp_server.py   (由 MCP 客户端以 stdio 方式启动)
+依赖: pip install -r requirements.txt
+用法: python sonar_mcp_server.py(MCP 客户端以 stdio 启动)
 """
 
 from __future__ import annotations
@@ -24,6 +19,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -107,6 +103,9 @@ SONARQUBE_TOKEN = _resolve("SONARQUBE_TOKEN", "sonarqube.token", "")
 SONARQUBE_PROFILE = _resolve("SONARQUBE_PROFILE", "sonarqube.profile", "")
 SONARQUBE_PROJECT = _resolve("SONARQUBE_PROJECT", "sonarqube.project", "")
 
+# 远程规则缓存 TTL(秒):质量配置变化不频繁,缓存避免每次分析都重复网络拉取
+REMOTE_RULES_TTL = int(_resolve("SONAR_RULES_TTL", "remote_rules_ttl_seconds", 900))
+
 # analyze_code_snippet 的代码片段大小上限(字节)
 MAX_SNIPPET_BYTES = 1_000_000
 
@@ -125,6 +124,13 @@ mcp = FastMCP("sonar-local-mcp")
 
 _cached: dict | None = None  # 最近一次分析的完整报告(含 project / issues)
 
+# 远程规则拉取缓存:key = 配置签名(url/token/profile/project),value = (fetched_at, payload)
+_remote_rules_cache: dict[str, tuple[float, dict]] = {}
+
+# list_issues 过滤结果缓存(按 缓存id+过滤参数 定位,重新分析后自动失效)
+_list_cache_key: tuple | None = None
+_list_cache: list | None = None
+
 
 def _no_analysis() -> str:
     return json.dumps(
@@ -141,11 +147,24 @@ def _engine_error(msg: str) -> str:
 # 引擎调用
 # ---------------------------------------------------------------------------
 
+# 引擎 jar 缓存:(路径, mtime)。命中且 mtime 未变则直接用,避免每次分析重复 glob。
+_jar_cache: tuple[Path, float] | None = None
+
+
 def _find_jar() -> Path | None:
     """在引擎 target/ 目录自动发现最新构建的 fat jar,避免硬编码版本号。
 
     排除 maven-shade 生成的 original-* 瘦 jar 与旧的 *-shaded.jar 残留。
+    结果按 (路径, mtime) 缓存:jar 被重建(mtime 变化)时自动重新发现。
     """
+    global _jar_cache
+    if _jar_cache is not None:
+        path, mtime = _jar_cache
+        try:
+            if path.stat().st_mtime == mtime:
+                return path
+        except OSError:
+            pass
     target = ENGINE_DIR / "target"
     if not target.is_dir():
         return None
@@ -155,7 +174,9 @@ def _find_jar() -> Path | None:
     ]
     if not jars:
         return None
-    return max(jars, key=lambda p: p.stat().st_mtime)
+    best = max(jars, key=lambda p: p.stat().st_mtime)
+    _jar_cache = (best, best.stat().st_mtime)
+    return best
 
 
 def _engine_ready() -> str | None:
@@ -264,11 +285,21 @@ def _resolve_profile_key() -> str | None:
     return None
 
 
-def _fetch_remote_rules() -> Path | None:
-    """拉取远程质量配置的启用规则,写成引擎可读的 JSON,返回该文件路径。
+def _remote_signature() -> str:
+    """远程规则配置的签名,用于定位缓存。"""
+    return "|".join([SONARQUBE_URL, SONARQUBE_TOKEN, SONARQUBE_PROFILE, SONARQUBE_PROJECT])
 
-    未配置 SONARQUBE_URL/TOKEN 或规则拉取为空时返回 None(走本地默认规则)。
+
+def _fetch_remote_rules_payload() -> dict | None:
+    """拉取远程质量配置的启用规则,返回 payload dict 或 None(未配置/规则为空)。
+
+    按配置签名做 TTL 缓存:TTL 内命中直接返回缓存,避免每次分析都重复网络拉取。
+    未配置 SONARQUBE_URL/TOKEN 时无需网络,直接返回 None(走本地默认规则)。
     """
+    sig = _remote_signature()
+    cached = _remote_rules_cache.get(sig)
+    if cached is not None and time.time() - cached[0] < REMOTE_RULES_TTL:
+        return cached[1]
     profile = _resolve_profile_key()
     if profile is None:
         return None
@@ -295,16 +326,18 @@ def _fetch_remote_rules() -> Path | None:
         page += 1
     if not enabled:
         return None
-
-    rules_file = Path(tempfile.mkdtemp(prefix="sonarlocal-rules-")) / "rules.json"
-    rules_file.write_text(json.dumps({"enabled": enabled, "params": params}, ensure_ascii=False),
-                          encoding="utf-8")
-    return rules_file
+    payload = {"enabled": enabled, "params": params}
+    _remote_rules_cache[sig] = (time.time(), payload)
+    return payload
 
 
 def _run_engine(project_path: Path, out_path: Path, max_files: int,
-                rules_file: Path | None = None) -> dict:
-    """调用引擎 fat jar 执行离线分析,返回报告 dict。失败时抛 RuntimeError。"""
+                rules_payload: dict | None = None) -> dict:
+    """调用引擎 fat jar 执行离线分析,返回报告 dict。失败时抛 RuntimeError。
+
+    rules_payload 为远程规则 {"enabled", "params"};非 None 时写入临时文件交给引擎,
+    运行结束(含异常)后立即清理,避免残留临时目录。
+    """
     jar = _find_jar()
     if jar is None:
         raise RuntimeError(
@@ -316,8 +349,12 @@ def _run_engine(project_path: Path, out_path: Path, max_files: int,
         "--out", str(out_path),
         "--max-files", str(max_files),
     ]
-    if rules_file is not None:
-        cmd += ["--rules", str(rules_file)]
+    rules_file: str | None = None
+    if rules_payload is not None:
+        fd, rules_file = tempfile.mkstemp(prefix="sonarlocal-rules-", suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(rules_payload, f, ensure_ascii=False)
+        cmd += ["--rules", rules_file]
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True,
@@ -332,6 +369,12 @@ def _run_engine(project_path: Path, out_path: Path, max_files: int,
         ) from None
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"analysis timed out after {ANALYZE_TIMEOUT}s") from None
+    finally:
+        if rules_file is not None:
+            try:
+                os.unlink(rules_file)
+            except OSError:
+                pass
 
     if proc.returncode != 0:
         stderr = (proc.stderr or "").strip()
@@ -400,6 +443,26 @@ def _filter_issues(items: list, severities: str = "", min_severity: str = "") ->
     return result
 
 
+def _filtered_issues(severity: str, rule: str, min_severity: str) -> list:
+    """过滤最近一次分析结果并缓存:翻页只做切片(O(1)),避免每次全量重过滤。
+
+    缓存键含 id(_cached),重新分析替换报告后自动失效。
+    """
+    global _list_cache_key, _list_cache
+    key = (id(_cached), severity, rule, min_severity)
+    if key == _list_cache_key and _list_cache is not None:
+        return _list_cache
+    items = _filter_issues(
+        _cached.get("issues", []),
+        severity or DEFAULT_SEVERITY,
+        min_severity or DEFAULT_MIN_SEVERITY,
+    )
+    if rule:
+        items = [i for i in items if rule in (i.get("ruleKey") or "")]
+    _list_cache_key, _list_cache = key, items
+    return items
+
+
 def _summarize(items: list) -> dict:
     by_severity = Counter((i.get("severity") or "UNKNOWN") for i in items)
     by_type = Counter((i.get("type") or "UNKNOWN") for i in items)
@@ -411,15 +474,17 @@ def _summarize(items: list) -> dict:
     }
 
 
-def _hint(count: int, next_offset: int, filtered: bool) -> str:
-    """生成翻页提示。next_offset 由调用方计算并保证严格前进(否则死循环)。"""
+def _hint(count: int, next_offset: int, severity: str = "", min_severity: str = "", rule: str = "") -> str:
+    """生成翻页提示,把实际生效的过滤条件写进建议调用,避免翻页丢过滤。"""
     if next_offset >= count:
         return ""
+    args = [f"offset={next_offset}", "limit=100"]
+    for k, v in (("severity", severity), ("min_severity", min_severity), ("rule", rule)):
+        if v:
+            args.append(f"{k}={v!r}")
     return (
         f"{count - next_offset} more issue(s) not shown. "
-        f"use list_issues(offset={next_offset}, limit=..."
-        + (", severity=..., rule=...)" if filtered else ")")
-        + " to fetch the next page"
+        f"use list_issues({', '.join(args)}) to fetch the next page"
     )
 
 
@@ -432,17 +497,14 @@ def analyze_project(project_path: str, max_files: int = 200, max_issues: int = 5
                     severity: str = "", min_severity: str = "") -> str:
     """对本地 Java 项目执行 Sonar 引擎离线分析,返回汇总统计 + issues 列表(JSON)。
 
-    返回体有大小上限,超出部分会被截断并在 "hint" 中提示用 list_issues 分页获取,
-    因此本工具始终返回完整可解析的 JSON,不会因结果过大而报错。
+    返回体有大小上限,超出部分截断并在 "hint" 提示用 list_issues 分页取,始终返回完整可解析 JSON。
 
     Args:
         project_path: 项目根目录绝对路径。
         max_files: 最多分析文件数(0 = 不限,默认 200)。
-        max_issues: 报告内最多携带的 issue 条目数(默认 500,超出走分页)。
-        severity: 逗号分隔的严重级别集合(BLOCKER,CRITICAL,MAJOR,MINOR,INFO),
-                  留空 = 全部(或回退到 SONAR_SEVERITY 配置)。例如 "BLOCKER,CRITICAL,MAJOR"。
-        min_severity: 只保留等于或高于该级别的问题(如 MAJOR = 输出 BLOCKER/CRITICAL/MAJOR),
-                      留空 = 不按最低级别过滤(或回退到 SONAR_MIN_SEVERITY 配置)。
+        max_issues: 本次最多返回条数(默认 500,超出走分页)。
+        severity: 严重级别集合(逗号分隔,可选 BLOCKER/CRITICAL/MAJOR/MINOR/INFO,留空用配置/全部)。
+        min_severity: 只保留等于或更严重者(如 MAJOR 输出 BLOCKER/CRITICAL/MAJOR,留空不按此过滤)。
     """
     ready = _engine_ready()
     if ready:
@@ -461,18 +523,20 @@ def analyze_project(project_path: str, max_files: int = 200, max_issues: int = 5
     out_path = REPORT
     out_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        rules_file = _fetch_remote_rules()
+        rules_payload = _fetch_remote_rules_payload()
     except RuntimeError as e:
         return _engine_error(str(e))
     try:
-        data = _run_engine(src, out_path, max_files, rules_file)
+        data = _run_engine(src, out_path, max_files, rules_payload)
     except RuntimeError as e:
         return _engine_error(str(e))
 
     _cached = data
     items = data.get("issues", [])
     # 未显式传过滤条件时,回退到用户配置的默认过滤(SONAR_SEVERITY / SONAR_MIN_SEVERITY)
-    items = _filter_issues(items, severity or DEFAULT_SEVERITY, min_severity or DEFAULT_MIN_SEVERITY)
+    eff_sev = severity or DEFAULT_SEVERITY
+    eff_min = min_severity or DEFAULT_MIN_SEVERITY
+    items = _filter_issues(items, eff_sev, eff_min)
     shown, clipped = _clip(items, max_issues)
     result = {
         "project": data.get("project"),
@@ -482,7 +546,7 @@ def analyze_project(project_path: str, max_files: int = 200, max_issues: int = 5
         "issues": shown,
         "shown": len(shown),
         "truncated": clipped or len(items) > max_issues,
-        "hint": _hint(len(items), len(shown), filtered=False),
+        "hint": _hint(len(items), len(shown), severity=eff_sev, min_severity=eff_min),
     }
     return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -493,29 +557,26 @@ def list_issues(severity: str = "", rule: str = "", min_severity: str = "",
     """分页过滤最近一次分析的结果(先调 analyze_project)。
 
     Args:
-        severity: 逗号分隔的严重级别集合(BLOCKER,CRITICAL,MAJOR,MINOR,INFO),
-                  留空 = 全部(或回退到 SONAR_SEVERITY 配置)。例如 "BLOCKER,CRITICAL,MAJOR"。
-        rule: 规则 key 子串(如 "java:S106"),留空 = 全部。
-        min_severity: 只保留等于或高于该级别的问题(如 MAJOR = 输出 BLOCKER/CRITICAL/MAJOR),
-                      留空 = 不按最低级别过滤(或回退到 SONAR_MIN_SEVERITY 配置)。
+        severity: 严重级别集合(逗号分隔,可选 BLOCKER/CRITICAL/MAJOR/MINOR/INFO,留空用配置/全部)。
+        rule: 规则 key 子串过滤(如 "java:S106",留空 = 全部)。
+        min_severity: 只保留等于或更严重者(如 MAJOR 输出 BLOCKER/CRITICAL/MAJOR,留空不按此过滤)。
         limit: 本次最多返回条数(默认 100,上限 500)。
         offset: 跳过前 N 条(用于翻页)。
     """
     if _cached is None:
         return _no_analysis()
 
-    # 未显式传过滤条件时,回退到用户配置的默认过滤(SONAR_SEVERITY / SONAR_MIN_SEVERITY)
-    items = _filter_issues(_cached.get("issues", []), severity or DEFAULT_SEVERITY, min_severity or DEFAULT_MIN_SEVERITY)
-    if rule:
-        items = [i for i in items if rule in (i.get("ruleKey") or "")]
-
+    items = _filtered_issues(severity, rule, min_severity)
+    # 未显式传的过滤条件回退到默认;翻页 hint 用有效值,保证翻页结果一致
+    eff_sev = severity or DEFAULT_SEVERITY
+    eff_min = min_severity or DEFAULT_MIN_SEVERITY
     limit = max(0, min(int(limit), 500))
     offset = max(0, int(offset))
     page = items[offset:offset + limit]
     shown, clipped = _clip(page, len(page))
     # 下一页 offset 必须严格大于当前 offset:当单条超大把 shown 裁到 0 时也至少前进 1
     next_offset = offset + max(len(shown), 1) if offset < len(items) else offset
-    hint = _hint(len(items), next_offset, filtered=bool(severity or rule))
+    hint = _hint(len(items), next_offset, severity=eff_sev, min_severity=eff_min, rule=rule)
     return json.dumps(
         {
             "count": len(items),
@@ -593,11 +654,11 @@ def analyze_code_snippet(code: str, file_name: str = "Snippet.java") -> str:
         (src_dir / name).write_text(code, encoding="utf-8")
         out_path = Path(tmp) / "report.json"
         try:
-            rules_file = _fetch_remote_rules()
+            rules_payload = _fetch_remote_rules_payload()
         except RuntimeError as e:
             return _engine_error(str(e))
         try:
-            data = _run_engine(src_dir, out_path, max_files=10, rules_file=rules_file)
+            data = _run_engine(src_dir, out_path, max_files=10, rules_payload=rules_payload)
         except RuntimeError as e:
             return _engine_error(str(e))
 
