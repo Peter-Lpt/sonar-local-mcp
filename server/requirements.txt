@@ -1,2 +1,2 @@
-# MCP Python SDK(stdio transport server)
-mcp>=1.0.0
+# MCP Python SDK(stdio transport server);sonar_mcp_server.py 使用 mcp<2 的 fastmcp API
+mcp>=1.0.0,<2

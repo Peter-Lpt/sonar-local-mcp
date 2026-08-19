@@ -38,7 +38,7 @@ ENGINE_DIR = BASE_DIR / "engine"
 REPORT = BASE_DIR / "reports" / "sonar-report.json"
 
 # ---------------------------------------------------------------------------
-# 统一配置:可选配置文件(默认仓库根 sonar-local-config.json,可用 SONAR_CONFIG 指定)
+# 统一配置:可选配置文件(默认 sonar-local-mcp 根目录的 sonar-local-config.json,可用 SONAR_CONFIG 指定)
 # + 环境变量覆盖。优先级:环境变量 > 配置文件 > 默认值。
 # 配置文件示例见 sonar-local-config.example.json。
 # ---------------------------------------------------------------------------
@@ -152,10 +152,11 @@ _jar_cache: tuple[Path, float] | None = None
 
 
 def _find_jar() -> Path | None:
-    """在引擎 target/ 目录自动发现最新构建的 fat jar,避免硬编码版本号。
+    """自动发现引擎 fat jar,避免硬编码版本号。
 
-    排除 maven-shade 生成的 original-* 瘦 jar 与旧的 *-shaded.jar 残留。
-    结果按 (路径, mtime) 缓存:jar 被重建(mtime 变化)时自动重新发现。
+    搜索顺序:分发位置 bin/ 优先(预构建 jar),其次引擎 target/
+    (源码本地 mvn 构建产物)。排除 maven-shade 生成的 original-* 瘦 jar 与旧的
+    *-shaded.jar 残留。结果按 (路径, mtime) 缓存:jar 被重建(mtime 变化)时自动重新发现。
     """
     global _jar_cache
     if _jar_cache is not None:
@@ -165,28 +166,32 @@ def _find_jar() -> Path | None:
                 return path
         except OSError:
             pass
-    target = ENGINE_DIR / "target"
-    if not target.is_dir():
+    candidates = [ENGINE_DIR / "bin", ENGINE_DIR / "target"]
+    found = None
+    for base in candidates:
+        if not base.is_dir():
+            continue
+        jars = [
+            p for p in base.glob("sonar-local-mcp-*.jar")
+            if not p.name.startswith("original-") and "-shaded" not in p.name
+        ]
+        if jars:
+            found = max(jars, key=lambda p: p.stat().st_mtime)
+            break
+    if found is None:
         return None
-    jars = [
-        p for p in target.glob("sonar-local-mcp-*.jar")
-        if not p.name.startswith("original-") and "-shaded" not in p.name
-    ]
-    if not jars:
-        return None
-    best = max(jars, key=lambda p: p.stat().st_mtime)
-    _jar_cache = (best, best.stat().st_mtime)
-    return best
+    _jar_cache = (found, found.stat().st_mtime)
+    return found
 
 
 def _engine_ready() -> str | None:
     """返回 None 表示可用;否则返回缺失组件的安装提示。"""
     if _find_jar() is None:
         return (
-            f"sonar-local-mcp.jar not found under {ENGINE_DIR / 'target'}\n"
+            f"sonar-local-mcp.jar not found under {ENGINE_DIR / 'bin'} or {ENGINE_DIR / 'target'}\n"
             "请先构建引擎工具(需要 JDK 17 与 Maven):\n"
             "  cd engine && mvn -B package -DskipTests\n"
-            "或从发布页下载预构建 jar 放到 engine/target/ 目录。"
+            "或从发布页下载预构建 jar 放到 engine/bin/ 目录。"
         )
     return _java_warning_once()
 
@@ -343,8 +348,12 @@ def _run_engine(project_path: Path, out_path: Path, max_files: int,
         raise RuntimeError(
             "engine jar not found, run `mvn -B package -DskipTests` in engine/ first"
         )
+    # 内嵌 sonar-java-plugin 跟随 fat jar:bin/ 分发 → bin/plugins;
+    # 源码构建(target/)→ target/plugins(maven-dependency-plugin 复制)。
+    # sonar-java-plugin 必须与 engine jar 同基础目录,故按 jar 所在目录取 plugins 子目录。
+    plugins_dir = str(jar.parent / "plugins")
     cmd = [
-        JAVA, "-jar", str(jar),
+        JAVA, f"-Dsonar.plugins.dir={plugins_dir}", "-jar", str(jar),
         "--src", str(project_path),
         "--out", str(out_path),
         "--max-files", str(max_files),

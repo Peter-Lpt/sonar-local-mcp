@@ -31,7 +31,10 @@ sonar-local-mcp.jar (Java, 内嵌 sonarlint-core)
 sonar-local-mcp/
 ├── engine/                              # Java 引擎(内嵌 sonarlint-core)
 │   ├── pom.xml                          # 构建配置
-│   └── src/main/java/com/sonarlocal/SonarLocal.java
+│   ├── src/main/java/com/sonarlocal/SonarLocal.java
+│   └── bin/                             # 分发产物:命中引擎 jar + plugins/(免构建)
+│       ├── sonar-local-mcp-<version>.jar
+│       └── plugins/sonar-java-plugin-*.jar
 ├── server/
 │   ├── sonar_mcp_server.py              # MCP server(FastMCP, stdio)
 │   ├── test_client.py                   # 协议往返回归测试
@@ -45,25 +48,38 @@ sonar-local-mcp/
 
 ## 快速开始
 
+两种使用方式,选其一:
+
+- **方式 A(推荐):直接使用预构建产物**。`engine/bin/` 已随仓库分发引擎 fat jar + `sonar-java-plugin`,无需 Maven 构建。首次运行时用 `bin/wrapper.sh` 自举 Python 依赖(uv 优先,无 uv 则 venv+pip),`exec` 真正的 server;后续每次调用复用已有 `.venv`。
+- **方式 B:源码自建**。需 JDK 17+ 与 Maven,在 `engine/` 下 `mvn -B package -DskipTests`。
+
 ### 环境要求
 
 | 组件 | 版本 | 说明 |
 |---|---|---|
-| JDK | **17+** | `sonarlint-core 9.8` 硬性要求 |
+| JDK | **17+** | `sonarlint-core 9.8` 硬性要求(引擎 jar 运行时的 JVM) |
 | Python | 3.10+ | 运行 MCP server |
-| `mcp` SDK | ≥1.0 | `pip install -r server/requirements.txt` |
-| Maven | 3.6+ | **仅源码构建时需要**;直接用预构建 jar 则不需要 |
+| Maven | 3.6+ | **仅方式 B(源码自建)时需要**;方式 A 用预构建 jar 不需要 |
 
-### 安装(源码构建)
+### 安装(方式 A:用预构建 jar)
+
+```bash
+# 首次启动:wrapper 自动创建 .venv 并安装依赖(mcp>=1,<2)
+./bin/wrapper.sh --help   # 或直接配置 MCP server 指向 wrapper
+```
+
+MCP server 会自动发现 jar(优先 `engine/bin/` 分发位置,其次 `engine/target/` 构建产物),升级时直接替换对应 jar 即可,无需改代码。
+
+### 安装(方式 B:源码构建)
 
 ```powershell
 cd engine
-mvn -B package -DskipTests          # 产物: target/sonar-local-mcp-0.0.1.jar + target/plugins/
+mvn -B package -DskipTests          # 产物: target/sonar-local-mcp-0.1.0.jar + target/plugins/
 cd ../server
-python -m pip install -r requirements.txt
+python -m pip install -r requirements.txt   # mcp>=1.0.0,<2
 ```
 
-MCP server 会自动发现 `engine/target/` 下最新的 jar,升级时直接替换即可,无需改代码。
+源码构建产物自动被 server 发现(target/ 兜底),可与 bin/ 并行存在。
 
 ### 快速验证
 
@@ -77,7 +93,7 @@ python test_client.py --src <你的Java项目目录> --max-files 30 --java C:\pa
 ### 命令行用法(不经 MCP)
 
 ```powershell
-java -jar engine\target\sonar-local-mcp-0.0.1.jar --src <项目目录> [--out report.json] [--max-files N] [--rules rules.json]
+java -jar engine\target\sonar-local-mcp-0.1.0.jar --src <项目目录> [--out report.json] [--max-files N] [--rules rules.json]
 ```
 
 - `--src` 必填;`--out` 不填则打印到 stdout;`--max-files 0` = 不限;`--rules` 指定规则覆盖文件(见"远程规则校验");
@@ -162,7 +178,7 @@ flowchart TD
 
 ### 统一配置文件(推荐)
 
-所有可配置项可集中放在一个 JSON 配置文件里(默认仓库根 `sonar-local-config.json`,可用环境变量 `SONAR_CONFIG` 指定其它路径),复制 `sonar-local-config.example.json` 即可;真实配置含 token 被 gitignore,不入库。**优先级:环境变量 > 配置文件 > 默认值**。
+所有可配置项可集中放在一个 JSON 配置文件里(默认 `sonar-local-mcp` 根目录下的 `sonar-local-config.json`,可用环境变量 `SONAR_CONFIG` 指定其它路径),复制 `sonar-local-config.example.json` 即可;真实配置含 token 被 gitignore,不入库。**优先级:环境变量 > 配置文件 > 默认值**。
 
 ```json
 {
@@ -190,7 +206,7 @@ flowchart TD
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `SONAR_CONFIG` | `sonar-local-config.json`(仓库根) | 统一配置文件路径(见上) |
+| `SONAR_CONFIG` | `sonar-local-config.json`(根目录) | 统一配置文件路径(见上) |
 | `SONAR_JAVA` | `java`(PATH 查找) | JDK 17+ 的 `java` 可执行文件路径 |
 | `SONAR_TIMEOUT` | `900` | 单次分析超时(秒) |
 | `SONAR_MAX_TEXT` | `12000` | 单个工具返回体最大字符数 |
@@ -237,7 +253,7 @@ Copy-Item -Recurse skills\sonar-local-mcp <你的skill目录>\
 ## 常见问题
 
 **Q: 提示 `sonar-local-mcp.jar not found`?**
-A: 引擎未构建。`cd engine && mvn -B package -DskipTests`(需 JDK 17 + Maven),或用预构建 jar 放入 `engine/target/`。
+A: 仓库自带预构建 jar 于 `engine/bin/`,正常应已发现。仅当文件被删除/改动,或走源码自建时:用 `cd engine && mvn -B package -DskipTests`(需 JDK 17 + Maven)重新构建,jar 会自动被 server 发现。
 
 **Q: 提示 Java launcher not found / 引擎启动失败?**
 A: 默认 `java` 不是 JDK 17,用 `SONAR_JAVA` 指向 JDK 17+ 的 `java.exe`。
@@ -269,5 +285,5 @@ A: 设计行为。按 `hint` 用 `list_issues(offset=..., limit=...)` 分页取,
 | `sonar-java-plugin` | **LGPL-3.0** | 独立 jar,`addPlugin` 加载 |
 
 - 完整第三方许可声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md);LGPL-3.0 副本见 [LICENSES/LGPL-3.0.txt](LICENSES/LGPL-3.0.txt);
-- 上述文本也已打进 `engine/target/sonar-local-mcp-*.jar` 的 `META-INF/`,随分发携带;
+- 上述文本也已打进 `engine/bin/sonar-local-mcp-*.jar`(分发件)与构建产物 `engine/target/sonar-local-mcp-*.jar` 的 `META-INF/`,随分发携带;
 - 若对外分发,请保留许可声明与版权声明;LGPL-3.0 要求允许以源码重链接,本项目 `mvn package` 即可用 pom 声明的 LGPL 源码重建 jar。
